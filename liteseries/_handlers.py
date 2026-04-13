@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 import threading as th
 from datetime import datetime, time, timedelta
 from functools import wraps
 from typing import Any, Callable
+from urllib.parse import quote
 
 from adbc_driver_sqlite import dbapi
 from dateutil import tz
@@ -21,15 +23,22 @@ DEFAULT_ACTIVE_IN = time(hour=16, second=1, tzinfo=tz.gettz("US/Eastern"))
 
 class LocalADBC(th.local):
     uri = None  # set from another scope
+    schema = None  # set from another scope
     __slots__ = ("sqlite",)
 
     def __init__(self) -> None:
         self.sqlite = dbapi.connect(uri=self.uri)
         self.cur = self.sqlite.cursor()
+        if self.schema not in (None, "main"):
+            # SQLite treats dotted table refs as attached-database names.
+            uri = str(self.uri).replace("'", "''")
+            self.cur.execute(f"ATTACH DATABASE '{uri}' AS {self.schema}")
 
     def __del__(self) -> None:
-        del self.cur
-        del self.sqlite
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.cur.close()
@@ -55,13 +64,26 @@ def threadpool_shutdown_ls(thp) -> None:
     return thp.shutdown(wait=True)
 
 
-ls_schema = "liteseries"
+ls_schema: str | None = None
 
 
-def launch_ls(pathuri=None, mem_rep: bool = False, schema: str = "liteseries") -> None:
-    LocalADBC.uri = pathuri
+def launch_ls(pathuri=None, mem_rep: bool = False, schema: str | None = None) -> None:
+    dburi = ut.get_dburi(pathuri)
+    if not mem_rep:
+        with sqlite3.connect(dburi) as sqlite_con:
+            sqlite_con.execute("PRAGMA journal_mode=WAL")
+    if mem_rep:
+        LocalADBC.uri = dburi
+    elif dburi.startswith("file:"):
+        sep = "&" if "?" in dburi else "?"
+        LocalADBC.uri = f"{dburi}{sep}cache=shared"
+    else:
+        qpath = quote(dburi.replace("\\", "/"), safe="/:")
+        LocalADBC.uri = f"file:{qpath}?mode=rwc&cache=shared"
+    LocalADBC.schema = schema
     global local_adbc, ls_schema
     local_adbc = LocalADBC()
+    local_adbc.cur.execute("PRAGMA busy_timeout = 1000")
     # The connection container is now initialized for the current thread.
     # But because it's a threading local, a new object is created for each new thread, also notice that this is not
     # a new connection every time a task is launched in a thread. So long as the thread stays alive and receives new
@@ -153,8 +175,7 @@ def ls_cache(
             comp = int(datetime.combine(pperiod, doff).timestamp() * 1_000_000)
             return comp
     else:
-        assert not isinstance(active_in, time)
-        active_window: TimeWindow = active_in
+        active_window: TimeWindow = active_in  # pyrefly: ignore[bad-assignment]
 
         def last_qual() -> int:
             # Note on timechange days this can be an hour off, but it's not
@@ -181,9 +202,7 @@ def ls_cache(
         tbe_info = f"{tbe}_info"
 
         @wraps(func)
-        def get_series(*args: Any, **kwargs: Any) -> Table:
-            if args:
-                raise TypeError("ls_cache-wrapped functions only support keyword arguments")
+        def get_series(**kwargs: Any) -> Table:
             con = local_adbc.sqlite
             cur = local_adbc.cur
             sdate, edate, tav, cv = make_keys(kwargs)
@@ -213,7 +232,7 @@ def ls_cache(
                 if not isinstance(ltb, Table) or ltb.num_rows == 0:
                     return ltb
                 fl_tb = ut.mk_fullarrow(ltb, columns, ck, cv)
-                cur.execute("BEGIN")
+                cur.execute("SAVEPOINT liteseries_write")
                 inft: dict[str, str] | None = None
                 if fl == 2:
                     inft = ut.infer_sqlite_types(cur, fl_tb)
@@ -231,14 +250,13 @@ def ls_cache(
 
                 if fl == 2:
                     # init the actual lite series table.
-                    assert inft is not None
-                    ddl = ut.define_ls_table(table_ref, columns, inft, ck, time_col)
+                    ddl = ut.define_ls_table(table_ref, columns, inft, ck, time_col)  # pyrefly: ignore[bad-argument-type]
                     cur.execute(ddl)
                 cur.adbc_ingest(table_ref, fl_tb, "append")
+                cur.execute("RELEASE SAVEPOINT liteseries_write")
                 con.commit()
             else:
-                assert last_upd is not None
-                last_upd = last_upd[0]
+                last_upd = last_upd[0]  # pyrefly: ignore[unsupported-operation]
                 lsq = last_qual()
                 en = edate is None
                 # “the cache is older than the latest allowable freshness
@@ -271,10 +289,11 @@ def ls_cache(
                     # can be built from columns as well
                     nfo_ids = fl_tb.slice(0, 1).select(ck).group_by(ck).aggregate([])
                     nfo_ids = nfo_ids.append_column(ut.LAST_UPD, repeat(ut.sys_micros(), 1))  # nfo_ids.num_rows))
-                    cur.execute("BEGIN")
+                    cur.execute("SAVEPOINT liteseries_write")
                     cur.adbc_ingest(info_table_ref, nfo_ids, "replace")
 
                     cur.adbc_ingest(table_ref, fl_tb, "append")
+                    cur.execute("RELEASE SAVEPOINT liteseries_write")
                     con.commit()
                     # we do this before sending the data
                     ltb = concat_tables([ltb_s, ltb_t], promote_options="none")

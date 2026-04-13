@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Sequence
 from itertools import chain
+from pathlib import Path
 
 import pyarrow as pa
 
@@ -11,8 +13,52 @@ from . import _sql
 LAST_UPD = _sql.LAST_UPD
 
 
-def get_dburi() -> None:
-    pass
+_FIRST_IMPORT_ROOT: Path | None = None
+
+
+def _cached_import_root() -> Path:
+    global _FIRST_IMPORT_ROOT
+    if _FIRST_IMPORT_ROOT is None:
+        main_file = getattr(__import__("__main__"), "__file__", None)
+        if main_file is not None:
+            _FIRST_IMPORT_ROOT = Path(main_file).resolve().parent
+        else:
+            _FIRST_IMPORT_ROOT = Path.cwd()
+    return _FIRST_IMPORT_ROOT
+
+
+def _pick_sqlite_file(root: Path) -> Path | None:
+    sqlite_files = list(root.glob("*.sqlite"))
+    if not sqlite_files:
+        return None
+
+    for path in sqlite_files:
+        if "liteseries" in path.stem.casefold():
+            return path
+
+    return sqlite_files[0]
+
+
+def get_dburi(path: str | None) -> str:
+    if path is not None:
+        db_path = Path(path).expanduser()
+        if not db_path.is_file():
+            raise FileNotFoundError(f"SQLite database file does not exist: {db_path}")
+        return str(db_path.resolve())
+
+    env_path = os.getenv("LITESERIES_DB")
+    if env_path:
+        return env_path
+
+    root = _cached_import_root()
+    sqlite_file = _pick_sqlite_file(root)
+    if sqlite_file is not None:
+        return str(sqlite_file.resolve())
+
+    db_path = root / "liteseries_db.sqlite"
+    db_path.touch(exist_ok=True)
+    print(f"Created new sqlite db at {db_path}")
+    return str(db_path.resolve())
 
 
 def sys_micros() -> int:
@@ -76,7 +122,7 @@ def mk_fullarrow(ar_tbl: pa.Table, full_cols, col_k, col_v):
     ln = ar_tbl.num_rows
     # Fills the table with values if not in ar_tbl already.
     cols = {name: ar_tbl[name] for name in names0} | {
-        name: pa.repeat(v, ln) for name, v in zip(col_k, col_v, strict=False) if name not in names0
+        name: pa.repeat(v, ln) for name, v in zip(col_k, col_v, strict=True) if name not in names0
     }
 
     names = sorted(cols, key=lambda name: full_cols.get(name, len(full_cols)))
