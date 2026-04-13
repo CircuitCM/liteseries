@@ -18,7 +18,7 @@ uv.lock
 dist/
 **/html
 progress.md
-nexus-tast.md
+nexus-task.md
 pyproject_temp.toml
 temp
 .agents
