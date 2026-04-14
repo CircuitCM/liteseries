@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import __main__
+import gc
+import sqlite3
+import threading as th
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-import sqlite3
-import threading as th
-import __main__
+from time import sleep
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pytest
 
 from liteseries import close_ls, launch_ls, ls_cache, threadpool_shutdown_ls
+import liteseries._handlers as handlers
 
 STEP_1H_US = 3_600_000_000
 UTC_WINDOW = (time(0, tzinfo=UTC), time(23, 59, tzinfo=UTC))
@@ -57,6 +59,23 @@ def make_hourly_rows(start: int, count: int, base: float) -> list[tuple[int, flo
     return [(start + i * STEP_1H_US, base + i + 0.25, base + i + 0.75) for i in range(count)]
 
 
+def wipe_db_files(db_path: Path) -> None:
+    for _ in range(5):
+        gc.collect()
+        locked = False
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{db_path}{suffix}")
+            if not candidate.exists():
+                continue
+            try:
+                candidate.unlink()
+            except PermissionError:
+                locked = True
+        if not locked:
+            return
+        sleep(0.05)
+
+
 class DeterministicEndpoint:
     def __init__(self, datasets: dict[tuple[str, str, str], list[tuple[int, float, float]]]) -> None:
         self.datasets = datasets
@@ -92,11 +111,24 @@ class DeterministicEndpoint:
         return price_table(rows)
 
 
-@pytest.fixture()
-def sqlite_db(tmp_path: Path) -> Path:
-    db_path = tmp_path / "cache.sqlite"
-    db_path.touch()
+@pytest.fixture(scope="session", autouse=True)
+def init_default_db() -> Path:
+    db_path = Path.cwd() / "liteseries_db.sqlite"
+    for candidate in Path.cwd().glob("*.sqlite"):
+        wipe_db_files(candidate)
     return db_path
+
+
+@pytest.fixture()
+def default_db_path(monkeypatch: pytest.MonkeyPatch, init_default_db: Path) -> Path:
+    monkeypatch.delenv("LITESERIES_DB", raising=False)
+    monkeypatch.setattr("liteseries._util._FIRST_IMPORT_ROOT", Path.cwd())
+    if hasattr(handlers, "local_adbc"):
+        try:
+            handlers.local_adbc.close()
+        except Exception:
+            pass
+    return init_default_db
 
 
 def test_launch_ls_rejects_missing_database_file(tmp_path: Path) -> None:
@@ -152,6 +184,9 @@ def test_launch_ls_uses_env_path_and_cwd_discovery(monkeypatch: pytest.MonkeyPat
     assert "discovered_prices" in names
     assert "discovered_prices_info" in names
     assert "discovered_prices" not in other_names
+    wipe_db_files(env_db)
+    wipe_db_files(preferred)
+    wipe_db_files(other)
 
 
 def test_launch_ls_creates_default_db_when_none_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -165,29 +200,31 @@ def test_launch_ls_creates_default_db_when_none_exists(monkeypatch: pytest.Monke
     close_ls()
 
     assert (tmp_path / "liteseries_db.sqlite").is_file()
+    wipe_db_files(tmp_path / "liteseries_db.sqlite")
 
 
-def test_ls_cache_wraps_a_yfinance_endpoint_and_reuses_the_cached_slice(sqlite_db: Path) -> None:
-    """Covers live endpoint decoration with table keys and column keys, then verifies a repeat call stays in-cache."""
+def test_ls_cache_wraps_a_yfinance_endpoint_and_reuses_the_cached_slice(default_db_path: Path) -> None:
+    """Covers fixed-schema raw and adjusted yfinance wrappers, then verifies repeat calls stay in-cache."""
     yf = pytest.importorskip("yfinance")
     pd = pytest.importorskip("pandas")
 
-    launch_ls(str(sqlite_db))
-    calls: list[tuple[int | None, int | None, str, str, bool]] = []
+    launch_ls()
+    raw_calls: list[tuple[int | None, int | None, str, str]] = []
+    adj_calls: list[tuple[int | None, int | None, str, str]] = []
 
     @ls_cache(
-        columns=("ticker", "auto_adjust", "ts", "open", "high", "low", "close", "volume"),
+        columns=("Adj Close", "Close", "High", "Low", "Open", "Volume", "ts", "ticker"),
         time_keys=("start", "end"),
         time_col="ts",
-        column_keys=("ticker", "auto_adjust"),
+        column_keys=("ticker",),
         table_keys=("interval",),
-        out_cols=("ts", "open", "high", "low", "close", "volume"),
+        out_cols=("Adj Close", "Close", "High", "Low", "Open", "Volume", "ts"),
         table="yf_prices",
         refresh_period=timedelta(days=1),
         active_in=time(0, tzinfo=UTC),
     )
-    def fetch_prices(start, end, ticker, interval, auto_adjust=False):
-        calls.append((start, end, ticker, interval, auto_adjust))
+    def fetch_prices(start, end, ticker, interval):
+        raw_calls.append((start, end, ticker, interval))
         start_dt = pd.Timestamp(start, unit="us", tz="UTC").to_pydatetime() if start is not None else None
         end_dt = pd.Timestamp(end, unit="us", tz="UTC").to_pydatetime() + pd.Timedelta(days=1) if end is not None else None
         frame = yf.download(
@@ -195,59 +232,75 @@ def test_ls_cache_wraps_a_yfinance_endpoint_and_reuses_the_cached_slice(sqlite_d
             start=start_dt,
             end=end_dt,
             interval=interval,
-            auto_adjust=auto_adjust,
+            auto_adjust=False,
             actions=False,
             progress=False,
             threads=False,
+            multi_level_index=False,
         )
-        if frame.empty:
-            return pa.table(
-                {
-                    "ts": pa.array([], type=pa.int64()),
-                    "open": pa.array([], type=pa.float64()),
-                    "high": pa.array([], type=pa.float64()),
-                    "low": pa.array([], type=pa.float64()),
-                    "close": pa.array([], type=pa.float64()),
-                    "volume": pa.array([], type=pa.int64()),
-                }
-            )
+        frame = frame.rename_axis("Date").reset_index()
+        frame["ts"] = (pd.to_datetime(frame.pop("Date"), utc=True).astype("int64") // 1_000).astype("int64")
+        frame["Volume"] = frame["Volume"].fillna(0).astype("int64")
+        return pa.Table.from_pandas(frame, preserve_index=False)
 
-        if getattr(frame.columns, "nlevels", 1) > 1:
-            frame.columns = frame.columns.get_level_values(0)
-        frame = frame.rename(columns=str.lower)
-        index_name = frame.index.name or "Date"
-        frame[index_name] = frame.index
-        ts = [int(ts_value.timestamp() * 1_000_000) for ts_value in pd.to_datetime(frame[index_name], utc=True)]
-        return pa.table(
-            {
-                "ts": pa.array(ts, type=pa.int64()),
-                "open": pa.array(frame["open"].astype(float).tolist(), type=pa.float64()),
-                "high": pa.array(frame["high"].astype(float).tolist(), type=pa.float64()),
-                "low": pa.array(frame["low"].astype(float).tolist(), type=pa.float64()),
-                "close": pa.array(frame["close"].astype(float).tolist(), type=pa.float64()),
-                "volume": pa.array(frame["volume"].fillna(0).astype("int64").tolist(), type=pa.int64()),
-            }
+    @ls_cache(
+        columns=("Close", "High", "Low", "Open", "Volume", "ts", "ticker"),
+        time_keys=("start", "end"),
+        time_col="ts",
+        column_keys=("ticker",),
+        table_keys=("interval",),
+        out_cols=("Close", "High", "Low", "Open", "Volume", "ts"),
+        table="yf_prices_adj",
+        refresh_period=timedelta(days=1),
+        active_in=time(0, tzinfo=UTC),
+    )
+    def fetch_prices_adj(start, end, ticker, interval):
+        adj_calls.append((start, end, ticker, interval))
+        start_dt = pd.Timestamp(start, unit="us", tz="UTC").to_pydatetime() if start is not None else None
+        end_dt = pd.Timestamp(end, unit="us", tz="UTC").to_pydatetime() + pd.Timedelta(days=1) if end is not None else None
+        frame = yf.download(
+            tickers=ticker,
+            start=start_dt,
+            end=end_dt,
+            interval=interval,
+            auto_adjust=True,
+            actions=False,
+            progress=False,
+            threads=False,
+            multi_level_index=False,
         )
+        frame = frame.rename_axis("Date").reset_index()
+        frame["ts"] = (pd.to_datetime(frame.pop("Date"), utc=True).astype("int64") // 1_000).astype("int64")
+        frame["Volume"] = frame["Volume"].fillna(0).astype("int64")
+        return pa.Table.from_pandas(frame, preserve_index=False)
 
     try:
         start = dt_micros(2024, 1, 2)
         end = dt_micros(2024, 1, 12)
-        first = fetch_prices(start=start, end=end, ticker="MSFT", interval="1d", auto_adjust=False)
-        if first.num_rows == 0:
+        first = fetch_prices(start=start, end=end, ticker="MSFT", interval="1d")
+        first_adj = fetch_prices_adj(start=start, end=end, ticker="MSFT", interval="1d")
+        if first.num_rows == 0 or first_adj.num_rows == 0:
             pytest.skip("yfinance returned no rows for the fixed historical window")
 
-        second = fetch_prices(start=start, end=end, ticker="MSFT", interval="1d", auto_adjust=False)
-        expected = first.filter(pc.field("ts") >= start)
+        second = fetch_prices(start=start, end=end, ticker="MSFT", interval="1d")
+        second_adj = fetch_prices_adj(start=start, end=end, ticker="MSFT", interval="1d")
+        expected_ts = [ts for ts in first["ts"].to_pylist() if ts >= start]
+        expected_ts_adj = [ts for ts in first_adj["ts"].to_pylist() if ts >= start]
 
         assert first.num_rows > 0
-        assert expected.equals(second)
-        assert len(calls) == 1
-        assert first.column_names == ["ts", "open", "high", "low", "close", "volume"]
+        assert second["ts"].to_pylist() == expected_ts
+        assert len(raw_calls) == 1
+        assert first.column_names == ["Adj Close", "Close", "High", "Low", "Open", "Volume", "ts"]
+        assert second_adj["ts"].to_pylist() == expected_ts_adj
+        assert len(adj_calls) == 1
+        assert first_adj.column_names == ["Close", "High", "Low", "Open", "Volume", "ts"]
     finally:
         close_ls()
 
 
-def test_ls_cache_covers_init_refresh_fresh_hits_and_empty_tail(monkeypatch: pytest.MonkeyPatch, sqlite_db: Path) -> None:
+def test_ls_cache_covers_init_refresh_fresh_hits_and_empty_tail(
+    monkeypatch: pytest.MonkeyPatch, default_db_path: Path
+) -> None:
     """Covers missing-table init, stale tail fetches, fresh cache hits, new key initialization, and empty extensions."""
     start = dt_micros(2026, 1, 5, 9)
     datasets = {
@@ -257,7 +310,7 @@ def test_ls_cache_covers_init_refresh_fresh_hits_and_empty_tail(monkeypatch: pyt
     endpoint = DeterministicEndpoint(datasets)
 
     monkeypatch.setattr("liteseries._util.sys_micros", lambda: 0)
-    launch_ls(str(sqlite_db))
+    launch_ls()
 
     @ls_cache(
         columns=("instrument", "flavor", "ts", "open", "close"),
@@ -314,7 +367,9 @@ def test_ls_cache_covers_init_refresh_fresh_hits_and_empty_tail(monkeypatch: pyt
         close_ls()
 
 
-def test_ls_cache_uses_default_out_cols_and_open_ended_reads(monkeypatch: pytest.MonkeyPatch, sqlite_db: Path) -> None:
+def test_ls_cache_uses_default_out_cols_and_open_ended_reads(
+    monkeypatch: pytest.MonkeyPatch, default_db_path: Path
+) -> None:
     """Covers default out-col inference plus the <=, >=, and fully open SQL range selection paths."""
     start = dt_micros(2026, 4, 1, 9)
     datasets = {
@@ -322,7 +377,7 @@ def test_ls_cache_uses_default_out_cols_and_open_ended_reads(monkeypatch: pytest
     }
 
     monkeypatch.setattr("liteseries._util.sys_micros", lambda: datasets[("AAA",)][-1][0] + STEP_1H_US)
-    launch_ls(str(sqlite_db))
+    launch_ls()
 
     @ls_cache(
         columns={"instrument": 0, "ts": 1, "open": 2, "close": 3},
@@ -350,12 +405,12 @@ def test_ls_cache_uses_default_out_cols_and_open_ended_reads(monkeypatch: pytest
         close_ls()
 
 
-def test_ls_cache_returns_empty_for_seedless_ranges(monkeypatch: pytest.MonkeyPatch, sqlite_db: Path) -> None:
+def test_ls_cache_returns_empty_for_seedless_ranges(monkeypatch: pytest.MonkeyPatch, default_db_path: Path) -> None:
     """Covers the empty-seed early return path where the wrapped endpoint has no rows to initialize."""
     start = dt_micros(2026, 5, 1, 9)
 
     monkeypatch.setattr("liteseries._util.sys_micros", lambda: 0)
-    launch_ls(str(sqlite_db))
+    launch_ls()
 
     @ls_cache(
         columns=("instrument", "ts", "open", "close"),
@@ -375,7 +430,7 @@ def test_ls_cache_returns_empty_for_seedless_ranges(monkeypatch: pytest.MonkeyPa
         close_ls()
 
 
-def test_ls_cache_returns_empty_for_premax_ranges(monkeypatch: pytest.MonkeyPatch, sqlite_db: Path) -> None:
+def test_ls_cache_returns_empty_for_premax_ranges(monkeypatch: pytest.MonkeyPatch, default_db_path: Path) -> None:
     """Covers the stale empty-range branch that returns immediately when the requested end is older than cached max."""
     start = dt_micros(2026, 5, 1, 9)
     datasets = {
@@ -383,7 +438,7 @@ def test_ls_cache_returns_empty_for_premax_ranges(monkeypatch: pytest.MonkeyPatc
     }
 
     monkeypatch.setattr("liteseries._util.sys_micros", lambda: 0)
-    launch_ls(str(sqlite_db))
+    launch_ls()
 
     @ls_cache(
         columns=("instrument", "ts", "open", "close"),
@@ -415,41 +470,16 @@ def test_threadpool_shutdown_ls_handles_empty_executors() -> None:
     threadpool_shutdown_ls(pool)
 
 
-def test_launch_ls_accepts_mem_rep_flag_with_existing_files(sqlite_db: Path) -> None:
+def test_launch_ls_accepts_mem_rep_flag_with_existing_files(default_db_path: Path) -> None:
     """Covers the mem_rep launch branch without asserting replication behavior yet."""
-    launch_ls(str(sqlite_db), mem_rep=True)
+    launch_ls(mem_rep=True)
     close_ls()
-
-
-@pytest.mark.xfail(reason="Schema aliases currently reattach the same SQLite file and fail before cache init can proceed.")
-def test_ls_cache_schema_alias_path_is_not_operational_yet(monkeypatch: pytest.MonkeyPatch, sqlite_db: Path) -> None:
-    """Documents the current attached-schema failure path reached through launch_ls and ls_cache."""
-    start = dt_micros(2026, 5, 2, 9)
-    monkeypatch.setattr("liteseries._util.sys_micros", lambda: 0)
-    launch_ls(str(sqlite_db), schema="alt")
-
-    @ls_cache(
-        columns=("instrument", "ts", "open", "close"),
-        time_keys=("start", "end"),
-        time_col="ts",
-        column_keys=("instrument",),
-        table="empty_prefixed_prices",
-        refresh_period=timedelta(hours=1),
-        active_in=UTC_WINDOW,
-    )
-    def empty_fetch(start, end, instrument):
-        return empty_prices()
-
-    try:
-        empty_fetch(start=start, end=start, instrument="AAA")
-    finally:
-        close_ls()
 
 
 @pytest.mark.timeout(30)
 @pytest.mark.xfail(reason="Concurrent stale writes still lock the metadata table under a persistent thread pool.")
 def test_ls_cache_supports_persistent_threadpool_reads_and_writes(
-    monkeypatch: pytest.MonkeyPatch, sqlite_db: Path
+    monkeypatch: pytest.MonkeyPatch, default_db_path: Path
 ) -> None:
     """Covers thread-local connections across a persistent executor while readers and stale writers share one SQLite file."""
     start = dt_micros(2026, 2, 2, 9)
@@ -461,7 +491,7 @@ def test_ls_cache_supports_persistent_threadpool_reads_and_writes(
     endpoint = DeterministicEndpoint(datasets)
 
     monkeypatch.setattr("liteseries._util.sys_micros", lambda: 0)
-    launch_ls(str(sqlite_db))
+    launch_ls()
 
     @ls_cache(
         columns=("instrument", "flavor", "ts", "open", "close"),

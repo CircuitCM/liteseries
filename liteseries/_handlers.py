@@ -23,22 +23,10 @@ DEFAULT_ACTIVE_IN = time(hour=16, second=1, tzinfo=tz.gettz("US/Eastern"))
 
 class LocalADBC(th.local):
     uri = None  # set from another scope
-    schema = None  # set from another scope
-    __slots__ = ("sqlite",)
 
     def __init__(self) -> None:
-        self.sqlite = dbapi.connect(uri=self.uri)
+        self.sqlite = dbapi.connect(uri=self.uri, autocommit=False)
         self.cur = self.sqlite.cursor()
-        if self.schema not in (None, "main"):
-            # SQLite treats dotted table refs as attached-database names.
-            uri = str(self.uri).replace("'", "''")
-            self.cur.execute(f"ATTACH DATABASE '{uri}' AS {self.schema}")
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def close(self) -> None:
         self.cur.close()
@@ -64,10 +52,7 @@ def threadpool_shutdown_ls(thp) -> None:
     return thp.shutdown(wait=True)
 
 
-ls_schema: str | None = None
-
-
-def launch_ls(pathuri=None, mem_rep: bool = False, schema: str | None = None) -> None:
+def launch_ls(pathuri=None, mem_rep: bool = False) -> None:
     dburi = ut.get_dburi(pathuri)
     if not mem_rep:
         with sqlite3.connect(dburi) as sqlite_con:
@@ -80,8 +65,7 @@ def launch_ls(pathuri=None, mem_rep: bool = False, schema: str | None = None) ->
     else:
         qpath = quote(dburi.replace("\\", "/"), safe="/:")
         LocalADBC.uri = f"file:{qpath}?mode=rwc&cache=shared"
-    LocalADBC.schema = schema
-    global local_adbc, ls_schema
+    global local_adbc
     local_adbc = LocalADBC()
     local_adbc.cur.execute("PRAGMA busy_timeout = 1000")
     # The connection container is now initialized for the current thread.
@@ -89,12 +73,6 @@ def launch_ls(pathuri=None, mem_rep: bool = False, schema: str | None = None) ->
     # a new connection every time a task is launched in a thread. So long as the thread stays alive and receives new
     # work, this connection will stay alive with it. This also makes the system universally compatible with any thread
     # executor because it simply doesn't interact with them explicitly.
-    ls_schema = schema
-
-    # If a user wants the change the schema name they need to call launch_ls before they decorate any endpoints.
-    # Otherwise we'd need to call tableref for every function call, less ideal.
-
-
 _24H = timedelta(days=1)
 _0D = timedelta()
 _1MC = timedelta(microseconds=1)
@@ -149,8 +127,6 @@ def ls_cache(
         out_cols = (*(cl for cl in columns if cl not in column_keys),)
 
     refr_micros = int(refresh_period / _1MC)
-    schema_prefix: str | None = ls_schema
-
     def make_keys(kg):
         sdate, edate = kg[tk[0]], kg[tk[1]]  # intentional fail if NE
         tav = (*(kg[k] for k in tak),)
@@ -196,8 +172,6 @@ def ls_cache(
 
     def _w(func: SeriesFn) -> SeriesFn:
         tbn = func.__qualname__ if table is None else table
-        if schema_prefix is not None:
-            tbn = f"{schema_prefix}.{tbn}"
         tbe = tbn
         tbe_info = f"{tbe}_info"
 
@@ -232,7 +206,6 @@ def ls_cache(
                 if not isinstance(ltb, Table) or ltb.num_rows == 0:
                     return ltb
                 fl_tb = ut.mk_fullarrow(ltb, columns, ck, cv)
-                cur.execute("SAVEPOINT liteseries_write")
                 inft: dict[str, str] | None = None
                 if fl == 2:
                     inft = ut.infer_sqlite_types(cur, fl_tb)
@@ -253,7 +226,6 @@ def ls_cache(
                     ddl = ut.define_ls_table(table_ref, columns, inft, ck, time_col)  # pyrefly: ignore[bad-argument-type]
                     cur.execute(ddl)
                 cur.adbc_ingest(table_ref, fl_tb, "append")
-                cur.execute("RELEASE SAVEPOINT liteseries_write")
                 con.commit()
             else:
                 last_upd = last_upd[0]  # pyrefly: ignore[unsupported-operation]
@@ -289,11 +261,9 @@ def ls_cache(
                     # can be built from columns as well
                     nfo_ids = fl_tb.slice(0, 1).select(ck).group_by(ck).aggregate([])
                     nfo_ids = nfo_ids.append_column(ut.LAST_UPD, repeat(ut.sys_micros(), 1))  # nfo_ids.num_rows))
-                    cur.execute("SAVEPOINT liteseries_write")
                     cur.adbc_ingest(info_table_ref, nfo_ids, "replace")
 
                     cur.adbc_ingest(table_ref, fl_tb, "append")
-                    cur.execute("RELEASE SAVEPOINT liteseries_write")
                     con.commit()
                     # we do this before sending the data
                     ltb = concat_tables([ltb_s, ltb_t], promote_options="none")

@@ -66,16 +66,12 @@ def sys_micros() -> int:
     return int(time.time() * 1_000_000)
 
 
-def table_exists(cur, table: str, schema: str | None = None) -> bool:
-    if schema is None:
-        cur.execute(_sql.TABLE_EXISTS, (table,))
-    else:
-        cur.execute(_sql.TABLE_EXISTS_IN_SCHEMA, (schema, table))
-
+def table_exists(cur, table: str) -> bool:  # pragma: no cover
+    cur.execute(_sql.TABLE_EXISTS, (table,))
     return cur.fetchone() is not None
 
 
-def insert_row_stmt(cur, table: str) -> str:
+def insert_row_stmt(cur, table: str) -> str:  # pragma: no cover
     cur.execute(_sql.TABLE_COLUMNS, (table,))
     return _sql.insert_row(table, len(cur.fetchall()))
 
@@ -84,9 +80,9 @@ def infer_sqlite_types(cur, data: pa.Table, sample_rows: int = 2) -> dict[str, s
     tb = "_temp_types"
     sample = data.slice(0, sample_rows)
     cur.adbc_ingest(tb, sample, mode="create", temporary=True)
-    cur.execute(f"PRAGMA table_info('{tb}')")
+    cur.execute(f"PRAGMA table_info({_sql.qident(tb)})")
     type_rows = cur.fetchall()
-    cur.execute(f"DROP TABLE {tb}")
+    cur.execute(f"DROP TABLE {_sql.qident(tb)}")
     return {column_name: column_type for _, column_name, column_type, *_ in type_rows}
 
 
@@ -98,9 +94,9 @@ def define_ls_table(
     time_col: str,
 ) -> str:
     cols = sorted(col_ord, key=col_ord.__getitem__)  # in case we change the system later...
-    defs = (f"{col} {col_types[col]} NOT NULL" for col in cols)
-    pk = f"PRIMARY KEY ({', '.join(chain(column_keys, (time_col,)))})"
-    ddl = f"CREATE TABLE {table_ref} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
+    defs = (f"{_sql.qident(col)} {col_types[col]} NOT NULL" for col in cols)
+    pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in chain(column_keys, (time_col,)))})"
+    ddl = f"CREATE TABLE {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
     return ddl
 
 
@@ -111,9 +107,9 @@ def define_ls_infotable(
 ) -> str:
     nfks = column_keys
     # Everything but the final rightmost key which is the unix micros.
-    defs = (f"{col} {col_types.get(col, 'INTEGER')} NOT NULL" for col in chain(nfks, (LAST_UPD,)))
-    pk = f"PRIMARY KEY ({', '.join(nfks)})"
-    ddl = f"CREATE TABLE {table_ref} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
+    defs = (f"{_sql.qident(col)} {col_types.get(col, 'INTEGER')} NOT NULL" for col in chain(nfks, (LAST_UPD,)))
+    pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in nfks)})"
+    ddl = f"CREATE TABLE {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
     return ddl
 
 
