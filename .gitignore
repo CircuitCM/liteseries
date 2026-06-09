@@ -21,6 +21,5 @@ progress.md
 nexus-task.md
 pyproject_temp.toml
 temp
-.agents
-.claude
-skills-lock.json
+liteseries_db.sqlite
+scratch.md

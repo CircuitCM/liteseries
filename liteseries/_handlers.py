@@ -7,12 +7,13 @@ from functools import wraps
 from typing import Any, Callable
 from urllib.parse import quote
 
+import pyarrow.compute as pc
 from adbc_driver_sqlite import dbapi
 from dateutil import tz
-from pyarrow import Table, concat_tables, repeat
+from pyarrow import Table, concat_tables
 
 from . import _util as ut
-from ._sql import last_upd_select, series_range_select, series_tmax_select
+from ._sql import insert_cols, last_upd_select, series_range_select, series_tmax_select, update_last_upd
 
 LT = list | tuple
 TimeWindow = tuple[time, time]
@@ -27,6 +28,8 @@ class LocalADBC(th.local):
     def __init__(self) -> None:
         self.sqlite = dbapi.connect(uri=self.uri, autocommit=False)
         self.cur = self.sqlite.cursor()
+        self.cur.execute("PRAGMA busy_timeout = 1000")
+        #self.sqlite.commit()
 
     def close(self) -> None:
         self.cur.close()
@@ -55,8 +58,13 @@ def threadpool_shutdown_ls(thp) -> None:
 def launch_ls(pathuri=None, mem_rep: bool = False) -> None:
     dburi = ut.get_dburi(pathuri)
     if not mem_rep:
-        with sqlite3.connect(dburi) as sqlite_con:
-            sqlite_con.execute("PRAGMA journal_mode=WAL")
+        sqlite_con = sqlite3.connect(dburi)
+        try:
+            sqlite_con.execute("PRAGMA journal_mode=WAL")  # ...idk man
+            sqlite_con.commit()
+        finally:
+            sqlite_con.close()
+
     if mem_rep:
         LocalADBC.uri = dburi
     elif dburi.startswith("file:"):
@@ -67,7 +75,6 @@ def launch_ls(pathuri=None, mem_rep: bool = False) -> None:
         LocalADBC.uri = f"file:{qpath}?mode=rwc&cache=shared"
     global local_adbc
     local_adbc = LocalADBC()
-    local_adbc.cur.execute("PRAGMA busy_timeout = 1000")
     # The connection container is now initialized for the current thread.
     # But because it's a threading local, a new object is created for each new thread, also notice that this is not
     # a new connection every time a task is launched in a thread. So long as the thread stays alive and receives new
@@ -82,11 +89,12 @@ def ls_cache(
     columns,
     time_keys: tuple[str, str],
     time_col: str,
-    column_keys: tuple,  # need at least one.
+    column_keys: tuple,  # need at least one. may change this req at some point.
     refresh_period: timedelta = timedelta(days=1),
     active_in: time | tuple[time, time] = DEFAULT_ACTIVE_IN,
     out_cols=None,
     table_keys=None,
+    expires_after: timedelta|None=None,
     rollback: bool = False,
     table=None,
 ) -> CacheDecorator:
@@ -96,8 +104,10 @@ def ls_cache(
     extension of the table name. Assumption is they appear as input values in the data function but not in the output
     array.
 
-    :param columns: All column names in the table, implicitly # of rows, and order of columns.
-    :param refresh_period: The period of passed time necessary to elicit an update from the timeseries endpoint. These
+    :param columns: All column names that come are included in the sqlite table. Implicitly # of rows, and order of 
+    columns. If the func endpoint doesn't have all those columns, they will be filled by those in column_keys, it's
+    possible that we can do without the extra column keys need.
+    :param refresh_period: The period of passed time necessary to elicit an update from the timeseries endpoint. This
         time period pass is calculated using the active_in inclusive range for less-than daily. For daily
         periods or greater, we assume time_keys is a single time that marks (assuming the current day) when it is valid
         to query the timeseries endpoint, think EOD OHLC at 4 pm EST. Or we take the second time of the sequence.
@@ -110,7 +120,9 @@ def ls_cache(
     :param table_keys: keys that make the full table name (example timeframes 1m, 1h, 1s).
     :param column_keys: keys that are included into the database as values for it's column. These will default to the
         function output columns, and otherwise fill values from the matching input kwargs.
-    :param rollback:  (mainly for continuous futures that are backwards adjusted on the next roll date).
+    :param out_cols: Specifically the ordered columns of the arrow table that will be produced by this wrapper. Always 
+    less than or equal to columns.
+    :param rollback:  Not implemented yet (mainly for continuous futures that are backwards adjusted on the next roll date).
         If we are querying new data, then we include the latest existing datetime in our new data query,
         if the returned row is not equal to the row from our database, then we log a warning, assume
         that timeseries entries for that specific matching key group are obsolete, remove them then
@@ -127,6 +139,9 @@ def ls_cache(
         out_cols = (*(cl for cl in columns if cl not in column_keys),)
 
     refr_micros = int(refresh_period / _1MC)
+    if expires_after is not None:
+        exp_micros = max(int(expires_after / _1MC), refr_micros * 2)
+
     def make_keys(kg):
         sdate, edate = kg[tk[0]], kg[tk[1]]  # intentional fail if NE
         tav = (*(kg[k] for k in tak),)
@@ -169,6 +184,11 @@ def ls_cache(
             n = (nw - sdt) // refresh_period
             cp = sdt + refresh_period * n
             return int(cp.timestamp() * 1_000_000)
+
+    def cache_upd(edate, lsq) -> int:
+        if edate is None or edate >= lsq:
+            return ut.sys_micros()
+        return edate
 
     def _w(func: SeriesFn) -> SeriesFn:
         tbn = func.__qualname__ if table is None else table
@@ -217,9 +237,7 @@ def ls_cache(
                 # Update: if we need multi-id support, it should now be possible just by changing it to the full agg.
                 # actually, would still need to handle the info table differently.
                 # init info and last update unix micros timestamp
-                nfo_ids = fl_tb.slice(0, 1).select(ck).group_by(ck).aggregate([])
-                nfo_ids = nfo_ids.append_column(ut.LAST_UPD, repeat(ut.sys_micros(), 1))  # nfo_ids.num_rows))
-                cur.adbc_ingest(info_table_ref, nfo_ids, "append")
+                cur.execute(insert_cols(info_table_ref, (*ck, ut.LAST_UPD)), (*cv, cache_upd(edate, last_qual())))
 
                 if fl == 2:
                     # init the actual lite series table.
@@ -227,6 +245,11 @@ def ls_cache(
                     cur.execute(ddl)
                 cur.adbc_ingest(table_ref, fl_tb, "append")
                 con.commit()
+                ltb=fl_tb.select(out_cols)
+                if sdate is not None:
+                    mask = pc.greater_equal(ltb[time_col], sdate)
+                    offset = pc.index(mask, value=True).as_py()
+                    ltb = ltb.slice(ltb.num_rows, 0) if offset == -1 else ltb.slice(offset)
             else:
                 last_upd = last_upd[0]  # pyrefly: ignore[unsupported-operation]
                 lsq = last_qual()
@@ -240,37 +263,44 @@ def ls_cache(
                     ltb_s = cur.fetchallarrow()
                     if ltb_s.num_rows == 0:
                         cur.execute(series_tmax_select(table_ref, ck, time_col), cv)
-                        mxt_row = cur.fetchone()
-                        if mxt_row is None:
+                        mxt = cur.fetchone()[0]
+                        if mxt is None:
                             return ltb_s
-                        mxt = mxt_row[0]  # assuming data exists now.
+                        #mxt = mxt_row[0]  # assuming data exists now.
                         # we know it queries too far back and the endpoint
                         # doesn't have data there.
                         if not en and edate < mxt:
+                            return ltb_s
+                        if expires_after is not None and mxt + exp_micros < last_upd:
                             return ltb_s
                         # if sdate>mxt: #we don't actually need this, as it's self evident for this case
                         n_sdate = mxt + refr_micros
                     else:
                         prv_tm = ltb_s[time_col][-1].as_py()
+                        if expires_after is not None and prv_tm + exp_micros < last_upd:
+                            return ltb_s
                         n_sdate = prv_tm + refr_micros
                     fix_range(n_sdate, edate, kwargs)
                     ltb_t = func(**kwargs)
                     if not isinstance(ltb_t, Table) or ltb_t.num_rows == 0:
+                        cur.execute(update_last_upd(info_table_ref, ck), (cache_upd(edate, lsq), *cv))
+                        con.commit()
                         return ltb_s
                     fl_tb = ut.mk_fullarrow(ltb_t, columns, ck, cv)
                     # can be built from columns as well
-                    nfo_ids = fl_tb.slice(0, 1).select(ck).group_by(ck).aggregate([])
-                    nfo_ids = nfo_ids.append_column(ut.LAST_UPD, repeat(ut.sys_micros(), 1))  # nfo_ids.num_rows))
-                    cur.adbc_ingest(info_table_ref, nfo_ids, "replace")
+                    cur.execute(update_last_upd(info_table_ref, ck), (cache_upd(edate, lsq), *cv))
 
                     cur.adbc_ingest(table_ref, fl_tb, "append")
                     con.commit()
                     # we do this before sending the data
+                    #ltb_s = ltb_s.select(out_cols) #already fetching by out_cols
+                    # we use fl_tb instead of ltb_t because out cols could contain more than what func produces
+                    ltb_t = fl_tb.select(out_cols)
                     ltb = concat_tables([ltb_s, ltb_t], promote_options="none")
 
                 else:  # We are requesting for data inside of edate or the new data query happened recently enough.
                     cur.execute(*series_range_select(table_ref, out_cols, ck, cv, time_col, sdate, edate))
-                    ltb = cur.fetchallarrow()
+                    ltb = cur.fetchallarrow()#.select(out_cols)
             return ltb
 
         return get_series

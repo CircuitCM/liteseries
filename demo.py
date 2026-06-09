@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC
 from datetime import datetime
 from datetime import time
@@ -13,6 +14,8 @@ from pyarrow import concat_tables
 from liteseries import close_ls
 from liteseries import launch_ls
 from liteseries import ls_cache
+
+os.environ["LITESERIES_PROTECTNAMES"]='true'
 
 launch_ls()
 

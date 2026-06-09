@@ -3,6 +3,7 @@ from datetime import time, timedelta
 from typing import Callable, TypeAlias
 from pyarrow import Table
 
+SeriesFn = Callable[..., Table]
 CacheDecorator: TypeAlias = Callable[[SeriesFn], SeriesFn]
 
 def close_ls() -> None: ...
@@ -17,6 +18,7 @@ def ls_cache(
     active_in: time | tuple[time, time] = ...,
     out_cols=None,
     table_keys=None,
+    expires_after: timedelta | None = ...,
     rollback: bool = False,
     table=None,
 ) -> CacheDecorator: ...

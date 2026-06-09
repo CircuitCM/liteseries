@@ -14,6 +14,7 @@ LAST_UPD = _sql.LAST_UPD
 
 
 _FIRST_IMPORT_ROOT: Path | None = None
+_DEFAULT_DB_NAME = "liteseries_db.sqlite"
 
 
 def _cached_import_root() -> Path:
@@ -39,26 +40,52 @@ def _pick_sqlite_file(root: Path) -> Path | None:
     return sqlite_files[0]
 
 
+def _is_file_uri(path: str) -> bool:
+    return path.startswith("file:")
+
+
+def _looks_like_dir(path: str) -> bool:
+    return path.endswith(("/", "\\"))
+
+
+def _sqlite_path(path: str) -> Path:
+    db_path = Path(path).expanduser()
+    if db_path.is_dir() or _looks_like_dir(path):
+        return db_path / _DEFAULT_DB_NAME
+    if db_path.suffix.casefold() != ".sqlite":
+        return db_path.with_suffix(".sqlite")
+    return db_path
+
+
+def _touch_sqlite(db_path: Path) -> str:
+    pte = db_path.exists()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.touch(exist_ok=True)
+    if not pte:
+        print(f"Created new sqlite db at {db_path}")
+    return str(db_path.resolve())
+
+
 def get_dburi(path: str | None) -> str:
     if path is not None:
-        db_path = Path(path).expanduser()
-        if not db_path.is_file():
-            raise FileNotFoundError(f"SQLite database file does not exist: {db_path}")
-        return str(db_path.resolve())
+        if _is_file_uri(path):
+            return path
+        return _touch_sqlite(_sqlite_path(path))
 
     env_path = os.getenv("LITESERIES_DB")
     if env_path:
-        return env_path
+        if _is_file_uri(env_path):
+            return env_path
+        return _touch_sqlite(_sqlite_path(env_path))
 
     root = _cached_import_root()
     sqlite_file = _pick_sqlite_file(root)
     if sqlite_file is not None:
-        return str(sqlite_file.resolve())
+        return _touch_sqlite(sqlite_file)
 
-    db_path = root / "liteseries_db.sqlite"
-    db_path.touch(exist_ok=True)
-    print(f"Created new sqlite db at {db_path}")
-    return str(db_path.resolve())
+    db_path = root / _DEFAULT_DB_NAME
+    dburi = _touch_sqlite(db_path)
+    return dburi
 
 
 def sys_micros() -> int:
@@ -96,7 +123,7 @@ def define_ls_table(
     cols = sorted(col_ord, key=col_ord.__getitem__)  # in case we change the system later...
     defs = (f"{_sql.qident(col)} {col_types[col]} NOT NULL" for col in cols)
     pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in chain(column_keys, (time_col,)))})"
-    ddl = f"CREATE TABLE {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
+    ddl = f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
     return ddl
 
 
@@ -109,17 +136,18 @@ def define_ls_infotable(
     # Everything but the final rightmost key which is the unix micros.
     defs = (f"{_sql.qident(col)} {col_types.get(col, 'INTEGER')} NOT NULL" for col in chain(nfks, (LAST_UPD,)))
     pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in nfks)})"
-    ddl = f"CREATE TABLE {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
+    ddl = f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
     return ddl
 
 
 def mk_fullarrow(ar_tbl: pa.Table, full_cols, col_k, col_v):
-    names0 = ar_tbl.column_names
+    names0 = set(ar_tbl.column_names)
     ln = ar_tbl.num_rows
-    # Fills the table with values if not in ar_tbl already.
-    cols = {name: ar_tbl[name] for name in names0} | {
+    # Reuse existing Arrow column views; only missing key columns allocate filled arrays.
+    new_cols = {
         name: pa.repeat(v, ln) for name, v in zip(col_k, col_v, strict=True) if name not in names0
     }
+    names = sorted((*ar_tbl.column_names, *new_cols), key=lambda name: full_cols.get(name, len(full_cols)))
+    cols = [ar_tbl.column(name) if name in names0 else new_cols[name] for name in names]
 
-    names = sorted(cols, key=lambda name: full_cols.get(name, len(full_cols)))
-    return pa.table([cols[name] for name in names], names=names)
+    return pa.Table.from_arrays(cols, names=names)

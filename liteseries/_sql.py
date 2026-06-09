@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 TABLE_EXISTS = "SELECT 1 FROM pragma_table_list WHERE name = ?   AND type = 'table' LIMIT 1"
 
 TABLE_COLUMNS = "SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0 ORDER BY cid"
@@ -9,10 +11,28 @@ LAST_UPD = "last_upd"
 _ASEQ_C = {}
 _QMRK_C = {}
 _REQ_C = {}
+_INS_C = {}
+_UPD_C = {}
 
 
-def qident(ident: str) -> str:
-    return f'"{ident.replace("\"", "\"\"")}"'
+def _protect_names_enabled() -> bool:
+    """Return whether SQL identifiers should be double-quoted."""
+    return os.getenv("LITESERIES_PROTECTNAMES", "").casefold() == "true"
+
+
+def _qident_protected(ident: str) -> str:
+    """Quote an SQLite identifier and escape embedded double quotes."""
+    dquote, escaped_dquote = '"', '""'
+    return f'"{ident.replace(dquote, escaped_dquote)}"'
+
+
+def _qident_plain(ident: str) -> str:
+    """Return an already-valid SQLite identifier without allocating a wrapper."""
+    return ident
+
+
+# Keep the hot path as a direct function binding chosen once at import time.
+qident = _qident_protected if _protect_names_enabled() else _qident_plain
 
 
 def and_seq(cols: tuple):
@@ -59,6 +79,24 @@ def series_tmax_select(table_ref: str, pidx: tuple, time_col) -> str:
 
 def last_upd_select(table_ref: str, pidx: tuple) -> str:
     return f"SELECT {qident(LAST_UPD)} FROM {qident(table_ref)} WHERE {and_seq(pidx)}"
+
+
+def insert_cols(table_ref: str, cols: tuple[str, ...]) -> str:
+    key = (table_ref, cols)
+    rs = _INS_C.get(key)
+    if rs is None:
+        rs = f"INSERT INTO {qident(table_ref)} ({colreq(cols)}) VALUES ({qmarks(len(cols))})"
+        _INS_C[key] = rs
+    return rs
+
+
+def update_last_upd(table_ref: str, pidx: tuple[str, ...]) -> str:
+    key = (table_ref, pidx)
+    rs = _UPD_C.get(key)
+    if rs is None:
+        rs = f"UPDATE {qident(table_ref)} SET {qident(LAST_UPD)} = ? WHERE {and_seq(pidx)}"
+        _UPD_C[key] = rs
+    return rs
 
 
 # change this to a cached statement later, we can keep using ingest, but for small
