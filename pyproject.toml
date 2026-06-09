@@ -23,7 +23,7 @@ packages = ["liteseries"]
 
 # Keep this template default visible, but disabled because it can alter wheel contents.
 [tool.hatch.build.targets.wheel.force-include]
-"typings/liteseries" = "liteseries"
+"typings/liteseries" = "liteseries" 
 
 [tool.coverage.run]
 branch = true
