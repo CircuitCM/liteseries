@@ -2,24 +2,41 @@ from __future__ import annotations
 
 import sqlite3
 import threading as th
+from collections.abc import Callable
 from datetime import datetime, time, timedelta
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote
 
+import pyarrow as pa
 import pyarrow.compute as pc
 from adbc_driver_sqlite import dbapi
 from dateutil import tz
 from pyarrow import Table, concat_tables
 
 from . import _util as ut
-from ._sql import insert_cols, last_upd_select, series_range_select, series_tmax_select, update_last_upd
+from ._sql import (
+    insert_cols,
+    last_upd_select,
+    qident,
+    rollback_adjust_update,
+    rollback_rebuild_update,
+    series_range_select,
+    series_tmax_select,
+    update_last_upd,
+)
+from ._util import Rollback
 
 LT = list | tuple
 TimeWindow = tuple[time, time]
 SeriesFn = Callable[..., Table]
 CacheDecorator = Callable[[SeriesFn], SeriesFn]
 DEFAULT_ACTIVE_IN = time(hour=16, second=1, tzinfo=tz.gettz("US/Eastern"))
+F32_WIDTH = 32
+EP32 = 16 * (2**-23)
+EP64 = 16 * (2**-52)
+NEW_KEY = 1
+NEW_TABLE = 2
 
 
 class LocalADBC(th.local):
@@ -80,6 +97,13 @@ def launch_ls(pathuri=None, mem_rep: bool = False) -> None:
     # a new connection every time a task is launched in a thread. So long as the thread stays alive and receives new
     # work, this connection will stay alive with it. This also makes the system universally compatible with any thread
     # executor because it simply doesn't interact with them explicitly.
+
+def inftime_bound(edate, lsq) -> int:
+    if edate is None or edate >= lsq:
+        return ut.sys_micros()
+    return edate
+
+
 _24H = timedelta(days=1)
 _0D = timedelta()
 _1MC = timedelta(microseconds=1)
@@ -94,8 +118,8 @@ def ls_cache(
     active_in: time | tuple[time, time] = DEFAULT_ACTIVE_IN,
     out_cols=None,
     table_keys=None,
-    expires_after: timedelta|None=None,
-    rollback: bool = False,
+    expires_after: timedelta | None = None,
+    rollback: Rollback | None = None,
     table=None,
 ) -> CacheDecorator:
     """
@@ -120,9 +144,9 @@ def ls_cache(
     :param table_keys: keys that make the full table name (example timeframes 1m, 1h, 1s).
     :param column_keys: keys that are included into the database as values for it's column. These will default to the
         function output columns, and otherwise fill values from the matching input kwargs.
-    :param out_cols: Specifically the ordered columns of the arrow table that will be produced by this wrapper. Always 
+    :param out_cols: Specifically, the ordered columns of the arrow table that will be produced by this wrapper. Always
     less than or equal to columns.
-    :param rollback:  Not implemented yet (mainly for continuous futures that are backwards adjusted on the next roll date).
+    :param rollback: Optional overlap adjustment for series whose historical values can be restated.
         If we are querying new data, then we include the latest existing datetime in our new data query,
         if the returned row is not equal to the row from our database, then we log a warning, assume
         that timeseries entries for that specific matching key group are obsolete, remove them then
@@ -156,17 +180,25 @@ def ls_cache(
         return kg
 
     if refresh_period >= _24H:
+        #So the current method actually retries on a 24hr cycle... basically anything larger is just treated as 1 day.
+        #In a future version this will be handled correctly, and support relativedelta and daylight savings.
+        #time after this period is valid.
         doff = active_in[1] if not isinstance(active_in, time) else active_in
 
         def last_qual() -> int:
             # ltime is unix micros
             # curn=datetime.fromtimestamp(ltime,dt.UTC) #timezone should be irrelevant but if issues, use doff's
-            tod = datetime.now(doff.tzinfo).date()
-            pperiod = tod - _24H
-            comp = int(datetime.combine(pperiod, doff).timestamp() * 1_000_000)
-            return comp
+            # today
+            td = datetime.now(doff.tzinfo)
+            tod = td.date()
+            # yesterday or today if after the inactive period.
+            pperiod = datetime.combine(tod, doff)
+            if td > pperiod:
+                pperiod = datetime.combine((tod - _24H), doff)
+            # if we want to support > 24h periods, we will need relativedelta support.
+            return int(pperiod.timestamp() * 1_000_000)
     else:
-        active_window: TimeWindow = active_in  # pyrefly: ignore[bad-assignment]
+        active_window: TimeWindow = active_in  # type: ignore[bad-assignment]
 
         def last_qual() -> int:
             # Note on timechange days this can be an hour off, but it's not
@@ -176,7 +208,7 @@ def ls_cache(
             nw = datetime.now(active_window[1].tzinfo)
             tod = nw.date()
             sdt = datetime.combine(tod, active_window[0])
-            day = tod - (_24H if sdt > nw else _0D)
+            day = (tod - _24H) if sdt > nw else tod
             sdt = datetime.combine(day, active_window[0])
             edt = datetime.combine(day, active_window[1])
             nw = min(nw, edt)
@@ -185,10 +217,47 @@ def ls_cache(
             cp = sdt + refresh_period * n
             return int(cp.timestamp() * 1_000_000)
 
-    def cache_upd(edate, lsq) -> int:
-        if edate is None or edate >= lsq:
-            return ut.sys_micros()
-        return edate
+    if rollback is not None:
+        #func to see if rollback is qualified given provided columns.
+        rebuild = rollback.rebuild
+        adj_cols = tuple(rollback.adjust_columns)
+
+        def is_rb(kwargs):
+            if rollback.included_keys is None:
+                return True
+            return any(kwargs[k] in v for k, v in rollback.included_keys.items())
+
+        # Takes the first endpoint result and compares it with the last cached result.
+
+        def adj_floats(db_tbl, func_tbl):
+            if db_tbl.num_rows == 0 or func_tbl.num_rows == 0:
+                return None
+            changed = False
+            vals = []
+            for col in adj_cols:
+                db_val = db_tbl[col][-1].as_py()
+                func_val = func_tbl[col][0].as_py()
+                bit_width = db_tbl[col].type.bit_width
+                eps = EP32 if bit_width == F32_WIDTH else EP64
+                changed = changed or abs(db_val - func_val) > eps * abs(db_val)
+                vals.append((db_val, func_val))
+            if not changed:
+                return None
+            return (*(db_val / func_val for db_val, func_val in vals),)
+
+    else:
+        rebuild = None
+
+        def is_rb(kwargs): return False
+
+        def adj_floats(db_tbl, func_tbl): pass #this branch will never be reached so no impl.
+
+    def slice_from(tbl, start):
+        if start is None or tbl.num_rows == 0:
+            return tbl
+        mask = pc.greater_equal(tbl[time_col], start)
+        offset = pc.index(mask, value=True).as_py()
+        return tbl.schema.empty_table() if offset == -1 else tbl.slice(offset)
 
     def _w(func: SeriesFn) -> SeriesFn:
         tbn = func.__qualname__ if table is None else table
@@ -216,9 +285,9 @@ def ls_cache(
                 cur.execute(last_upd_select(info_table_ref, ck), cv)
                 last_upd = cur.fetchone()
             except dbapi.DatabaseError:
-                fl = 2
-            if last_upd is None and fl != 2:
-                fl = 1
+                fl = NEW_TABLE
+            if last_upd is None and fl != NEW_TABLE:
+                fl = NEW_KEY
 
             if fl > 0:
                 fix_range(None, edate, kwargs)
@@ -227,76 +296,116 @@ def ls_cache(
                     return ltb
                 fl_tb = ut.mk_fullarrow(ltb, columns, ck, cv)
                 inft: dict[str, str] | None = None
-                if fl == 2:
+                if fl == NEW_TABLE:
                     inft = ut.infer_sqlite_types(cur, fl_tb)
 
                     ddl_nfo = ut.define_ls_infotable(info_table_ref, inft, ck)
                     cur.execute(ddl_nfo)
+
                 # Assumption, take away the timestamp, then the endpoint request only captures a single 'id' for the
                 # instrument. Otherwise re-enable the full pass check.
                 # Update: if we need multi-id support, it should now be possible just by changing it to the full agg.
                 # actually, would still need to handle the info table differently.
                 # init info and last update unix micros timestamp
-                cur.execute(insert_cols(info_table_ref, (*ck, ut.LAST_UPD)), (*cv, cache_upd(edate, last_qual())))
+                cur.execute(insert_cols(info_table_ref, (*ck, ut.LAST_UPD)), (*cv, inftime_bound(edate, last_qual())))
 
-                if fl == 2:
+                if fl == NEW_TABLE:
                     # init the actual lite series table.
-                    ddl = ut.define_ls_table(table_ref, columns, inft, ck, time_col)  # pyrefly: ignore[bad-argument-type]
+                    ddl = ut.define_ls_table(
+                        table_ref, columns, inft, ck, time_col
+                    )  # pyrefly: ignore[bad-argument-type]
                     cur.execute(ddl)
                 cur.adbc_ingest(table_ref, fl_tb, "append")
                 con.commit()
                 ltb=fl_tb.select(out_cols)
                 if sdate is not None:
-                    mask = pc.greater_equal(ltb[time_col], sdate)
-                    offset = pc.index(mask, value=True).as_py()
-                    ltb = ltb.slice(ltb.num_rows, 0) if offset == -1 else ltb.slice(offset)
+                    ltb = slice_from(ltb, sdate)
             else:
                 last_upd = last_upd[0]  # pyrefly: ignore[unsupported-operation]
-                lsq = last_qual()
                 en = edate is None
-                # “the cache is older than the latest allowable freshness
-                # boundary, and the request extends beyond what’s known fresh”
+                isrb = is_rb(kwargs)
+                exm = 0 if isrb else refr_micros
+                lsq = last_qual()
+                # The cache is older than the latest allowable freshness
+                # boundary, and the request extends beyond what's known fresh.
                 if lsq > last_upd and (en or edate > last_upd):
                     # Then the period we are asking for is not fully contained in our database.
                     # Selects the data here.
                     cur.execute(*series_range_select(table_ref, out_cols, ck, cv, time_col, sdate, edate))
-                    ltb_s = cur.fetchallarrow()
+                    ltb_s = ltb_ps = cur.fetchallarrow()
                     if ltb_s.num_rows == 0:
                         cur.execute(series_tmax_select(table_ref, ck, time_col), cv)
-                        mxt = cur.fetchone()[0]
-                        if mxt is None:
+                        ltb_ps = cur.fetchallarrow()
+                        if ltb_ps.num_rows == 0:
                             return ltb_s
+                        mxt = ltb_ps[time_col][0].as_py()
                         #mxt = mxt_row[0]  # assuming data exists now.
                         # we know it queries too far back and the endpoint
                         # doesn't have data there.
                         if not en and edate < mxt:
                             return ltb_s
-                        if expires_after is not None and mxt + exp_micros < last_upd:
+                        if expires_after is not None and mxt + exp_micros < last_upd:  # probably not <=
                             return ltb_s
                         # if sdate>mxt: #we don't actually need this, as it's self evident for this case
-                        n_sdate = mxt + refr_micros
+                        n_sdate = mxt + exm
                     else:
                         prv_tm = ltb_s[time_col][-1].as_py()
                         if expires_after is not None and prv_tm + exp_micros < last_upd:
                             return ltb_s
-                        n_sdate = prv_tm + refr_micros
+                        n_sdate = prv_tm + exm
                     fix_range(n_sdate, edate, kwargs)
                     ltb_t = func(**kwargs)
                     if not isinstance(ltb_t, Table) or ltb_t.num_rows == 0:
-                        cur.execute(update_last_upd(info_table_ref, ck), (cache_upd(edate, lsq), *cv))
+                        cur.execute(update_last_upd(info_table_ref, ck), (inftime_bound(edate, lsq), *cv))
                         con.commit()
                         return ltb_s
-                    fl_tb = ut.mk_fullarrow(ltb_t, columns, ck, cv)
-                    # can be built from columns as well
-                    cur.execute(update_last_upd(info_table_ref, ck), (cache_upd(edate, lsq), *cv))
+                    if isrb:
+                        #why we have at least one column for ltb_s, we also know that all adjust_columns are contained
+                        #in both arrow tables, even tho ltb_t isn't in out_cols form yet.
+                        cols = adj_floats(ltb_ps, ltb_t)
+                        if cols:
+                            if rebuild:
+                                prev_rows = ltb_s.num_rows
+                                prev_empty = ltb_s
+                                fix_range(None, n_sdate, kwargs)
+                                ltb_b = func(**kwargs)
+                                if not isinstance(ltb_b, Table) or ltb_b.num_rows == 0:
+                                    cur.execute(update_last_upd(info_table_ref, ck), (inftime_bound(edate, lsq), *cv))
+                                    con.commit()
+                                    return ltb_s
+                                rb_tb = ut.mk_fullarrow(ltb_b, columns, ck, cv)
+                                temp_ref = f"{table_ref}_rollback"
+                                #cur.execute(f"DROP TABLE IF EXISTS {qident(temp_ref)}")
+                                cur.adbc_ingest(temp_ref, rb_tb.select((time_col, *adj_cols)), "create", temporary=True)
+                                cur.execute(rollback_rebuild_update(table_ref, temp_ref, adj_cols, ck, time_col), cv)
+                                cur.execute(f"DROP TABLE {qident(temp_ref)}")
+                                ltb_s = rb_tb.select(out_cols)
+                                ltb_s = ltb_s.slice(ltb_s.num_rows - prev_rows) if prev_rows > 0 else prev_empty
+                            else:
+                                # Execute the back-adjust query and adjust the existing in-memory slice.
+                                cur.execute(rollback_adjust_update(table_ref, adj_cols, ck), (*cols, *cv))
+                                #Note this is not in-place. in the future make one that is.
+                                for col, val in zip(adj_cols, cols, strict=True):
+                                    idx = ltb_s.column_names.index(col)
+                                    ltb_s = ltb_s.set_column(idx, col, pc.multiply(ltb_s[col], pa.scalar(val)))
 
+                        ltb_t = ltb_t.slice(1)
+                    # ideally slicing ltb_t won't force any mem copy's when making the full arrow db write table.
+                    cur.execute(update_last_upd(info_table_ref, ck), (inftime_bound(edate, lsq), *cv))
+                    fl_tb = ut.mk_fullarrow(ltb_t, columns, ck, cv)
                     cur.adbc_ingest(table_ref, fl_tb, "append")
                     con.commit()
                     # we do this before sending the data
                     #ltb_s = ltb_s.select(out_cols) #already fetching by out_cols
-                    # we use fl_tb instead of ltb_t because out cols could contain more than what func produces
+                    # we use fl_tb instead of og ltb_t because out cols could contain more than what func produces
                     ltb_t = fl_tb.select(out_cols)
-                    ltb = concat_tables([ltb_s, ltb_t], promote_options="none")
+                    #ltb_s and ltb_t should be correct columns now.
+
+                    if ltb_s.num_rows == 0:
+                        ltb = slice_from(ltb_t, sdate)
+                    else:
+                        # we know that sdate is in the first row of ltb_s, so no need to return a slice but do concat.
+                        ltb = concat_tables([ltb_s, ltb_t], promote_options="none")
 
                 else:  # We are requesting for data inside of edate or the new data query happened recently enough.
                     cur.execute(*series_range_select(table_ref, out_cols, ck, cv, time_col, sdate, edate))

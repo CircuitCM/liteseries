@@ -8,12 +8,13 @@ past the saved range, it reads the local slice first and asks the vendor only fo
 is stable for single-threaded use, with parallel reads available where the Arrow backend supports them.
 
 ```python
-from liteseries import close_ls, launch_ls, ls_cache, threadpool_shutdown_ls
+from liteseries import Rollback, close_ls, launch_ls, ls_cache, threadpool_shutdown_ls
 ```
 
 - `launch_ls()` opens the local SQLite/ADBC runtime for the current thread.
 - `ls_cache(...)` decorates endpoint functions that return `pyarrow.Table`
   objects.
+- `Rollback(...)` enables overlap checks for adjusted historical series.
 - `close_ls()` closes the runtime connection when your process is done with it.
 - `threadpool_shutdown_ls(...)` for use in a multithreaded environment.
 
@@ -28,7 +29,7 @@ from datetime import UTC, datetime, time, timedelta
 
 import pyarrow as pa
 
-from liteseries import close_ls, launch_ls, ls_cache
+from liteseries import Rollback, close_ls, launch_ls, ls_cache
 
 
 def unix_micros(year: int, month: int, day: int) -> int:
@@ -174,6 +175,56 @@ the freshness boundary by `refresh_period` steps inside that window:
 def intraday_prices(start, end, symbol, interval):
     """Cache one interval per SQLite table, keyed by symbol within each table."""
     return vendor_prices(start, end, symbol, interval=interval)
+```
+
+### Rollback Adjustments
+
+Some historical series are restated when a contract rolls, a split is applied, or
+a vendor back-adjusts prior bars. Pass `rollback=Rollback(...)` when a stale
+refresh should overlap the latest cached row and compare selected value columns.
+
+With the default multiplier strategy, liteseries compares the last cached row
+with the first endpoint row from the overlap. If any `adjust_columns` value has
+changed beyond floating-point tolerance, it multiplies the cached history for
+that key by the ratio between cached and endpoint values, then appends the new
+endpoint rows after the overlap:
+
+```python
+@ls_cache(
+    columns=("symbol", "ts", "open", "close"),
+    time_keys=("start", "end"),
+    time_col="ts",
+    column_keys=("symbol",),
+    table="continuous_prices",
+    refresh_period=timedelta(days=1),
+    active_in=time(16, 1, tzinfo=UTC),
+    rollback=Rollback(adjust_columns=("open", "close")),
+)
+def continuous_prices(start, end, symbol):
+    """Cache a back-adjusted continuous series."""
+    return vendor_prices(start, end, symbol, interval="1d")
+```
+
+Use `included_keys` to limit rollback checks to selected key values. `None`
+enables rollback for every request, which is the default.
+
+```python
+rollback=Rollback(
+    adjust_columns=("open", "close"),
+    included_keys={"symbol": {"ES_CONT"}},
+)
+```
+
+For providers where a simple multiplier is not enough, set `rebuild=True`.
+When an overlap changes, liteseries requests historical data again with
+`start=None`, stages the returned adjusted columns, and copies them into the
+existing cached rows without recreating the primary keys:
+
+```python
+rollback=Rollback(
+    adjust_columns=("open", "close"),
+    rebuild=True,
+)
 ```
 
 ### Columns And Names

@@ -13,6 +13,9 @@ _QMRK_C = {}
 _REQ_C = {}
 _INS_C = {}
 _UPD_C = {}
+_RBT_C = {}
+_RBU_C = {}
+_RBA_C = {}
 
 
 def _protect_names_enabled() -> bool:
@@ -74,7 +77,8 @@ def series_range_select(table_ref: str, req_cols: tuple, pidx: tuple, vidx, time
 
 
 def series_tmax_select(table_ref: str, pidx: tuple, time_col) -> str:
-    return f"SELECT MAX({qident(time_col)}) FROM {qident(table_ref)} WHERE {and_seq(pidx)}"
+    tc = qident(time_col)
+    return f"SELECT * FROM {qident(table_ref)} WHERE {and_seq(pidx)} ORDER BY {tc} DESC LIMIT 1"
 
 
 def last_upd_select(table_ref: str, pidx: tuple) -> str:
@@ -82,7 +86,8 @@ def last_upd_select(table_ref: str, pidx: tuple) -> str:
 
 
 def insert_cols(table_ref: str, cols: tuple[str, ...]) -> str:
-    key = (table_ref, cols)
+    # key = (table_ref, cols)
+    key = table_ref
     rs = _INS_C.get(key)
     if rs is None:
         rs = f"INSERT INTO {qident(table_ref)} ({colreq(cols)}) VALUES ({qmarks(len(cols))})"
@@ -91,11 +96,60 @@ def insert_cols(table_ref: str, cols: tuple[str, ...]) -> str:
 
 
 def update_last_upd(table_ref: str, pidx: tuple[str, ...]) -> str:
-    key = (table_ref, pidx)
+    # key = (table_ref, pidx)
+    key = table_ref
     rs = _UPD_C.get(key)
     if rs is None:
         rs = f"UPDATE {qident(table_ref)} SET {qident(LAST_UPD)} = ? WHERE {and_seq(pidx)}"
         _UPD_C[key] = rs
+    return rs
+
+
+def rollback_temp_table(table_ref: str, time_col: str, adjust_cols: tuple[str, ...], col_types: dict[str, str]) -> str:
+    """Build the temporary table DDL used to stage rebuilt rollback values."""
+    # key = (table_ref, time_col, adjust_cols, tuple((col, col_types[col]) for col in (time_col, *adjust_cols)))
+    key = table_ref
+    rs = _RBT_C.get(key)
+    if rs is None:
+        cols = (time_col, *adjust_cols)
+        defs = ", ".join(f"{qident(col)} {col_types[col]} NOT NULL" for col in cols)
+        pk = f"PRIMARY KEY ({qident(time_col)})"
+        rs = f"CREATE TEMP TABLE {qident(table_ref)} ({defs}, {pk}) STRICT, WITHOUT ROWID"
+        _RBT_C[key] = rs
+    return rs
+
+
+def rollback_rebuild_update(
+    table_ref: str,
+    temp_ref: str,
+    adjust_cols: tuple[str, ...],
+    pidx: tuple[str, ...],
+    time_col: str,
+) -> str:
+    """Build an update that copies staged rollback values into cached rows."""
+    # key = (table_ref, temp_ref, adjust_cols, pidx, time_col)
+    key = table_ref
+    rs = _RBU_C.get(key)
+    if rs is None:
+        dst, src = "_ls_dst", "_ls_src"
+        assignments = ", ".join(f"{qident(col)} = {src}.{qident(col)}" for col in adjust_cols)
+        key_match = " AND ".join(f"{dst}.{qident(col)} = ?" for col in pidx)
+        time_match = f"{dst}.{qident(time_col)} = {src}.{qident(time_col)}"
+        where = f"{key_match} AND {time_match}" if key_match else time_match
+        rs = f"UPDATE {qident(table_ref)} AS {dst} SET {assignments} FROM {qident(temp_ref)} AS {src} WHERE {where}"
+        _RBU_C[key] = rs
+    return rs
+
+
+def rollback_adjust_update(table_ref: str, adjust_cols: tuple[str, ...], pidx: tuple[str, ...]) -> str:
+    """Build an update that multiplies cached rollback columns by bound factors."""
+    # key = (table_ref, adjust_cols, pidx)
+    key = table_ref
+    rs = _RBA_C.get(key)
+    if rs is None:
+        assignments = ", ".join(f"{qident(col)} = {qident(col)} * ?" for col in adjust_cols)
+        rs = f"UPDATE {qident(table_ref)} SET {assignments} WHERE {and_seq(pidx)}"
+        _RBA_C[key] = rs
     return rs
 
 

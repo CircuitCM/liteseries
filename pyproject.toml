@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
 
 [project]
 name = "liteseries"
-version = "1.0.0"
+version = "1.1.0"
 description = "SQLite-backed local caching helpers for time series data."
 authors = [{ name = "Charles Marks", email = "charlesmarksco@gmail.com" }]
 readme = "README.md" 
@@ -17,13 +17,9 @@ dependencies = [
   "python-dateutil",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["liteseries"]
-
-
-# Keep this template default visible, but disabled because it can alter wheel contents.
-[tool.hatch.build.targets.wheel.force-include]
-"typings/liteseries" = "liteseries" 
+[tool.uv.build-backend]
+module-name = "liteseries"
+module-root = ""
 
 [tool.coverage.run]
 branch = true
@@ -87,6 +83,11 @@ combine-as-imports = true
 force-single-line = false
 required-imports = ["from __future__ import annotations"]
 # float-to-top = true
+
+[tool.ruff.lint.per-file-ignores]
+"liteseries/_handlers.py" = ["PLR1702", "PLW0603"]
+"liteseries/_util.py" = ["PLW0603"]
+"tests/integration/test_public_api.py" = ["E501", "PLR2004", "SIM105", "SIM223"]
 
 [tool.ruff.analyze]
 detect-string-imports = true
