@@ -1,0 +1,12 @@
+_______________ coverage: platform win32, python 3.13.9-final-0 _______________
+
+Name                      Stmts   Miss Branch BrPart  Cover   Missing
+---------------------------------------------------------------------
+liteseries\_handlers.py     249     13     78      8    93%   68-72, 88-89, 234, 253->exit, 257, 321->413, 340, 373-375
+liteseries\_sql.py           93      9     20      2    88%   111-119, 133->141, 149->153
+liteseries\_util.py          89      4     24      3    94%   38, 70, 76, 89
+---------------------------------------------------------------------
+TOTAL                       435     26    122     13    92%
+
+1 file skipped due to complete coverage.
+============ 24 passed, 1 skipped, 1 xfailed, 2 warnings in 2.41s =============

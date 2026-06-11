@@ -5,6 +5,7 @@ import time
 from collections.abc import Sequence
 from itertools import chain
 from pathlib import Path
+from typing import NamedTuple
 
 import pyarrow as pa
 
@@ -21,10 +22,7 @@ def _cached_import_root() -> Path:
     global _FIRST_IMPORT_ROOT
     if _FIRST_IMPORT_ROOT is None:
         main_file = getattr(__import__("__main__"), "__file__", None)
-        if main_file is not None:
-            _FIRST_IMPORT_ROOT = Path(main_file).resolve().parent
-        else:
-            _FIRST_IMPORT_ROOT = Path.cwd()
+        _FIRST_IMPORT_ROOT = Path(main_file).resolve().parent if main_file is not None else Path.cwd()
     return _FIRST_IMPORT_ROOT
 
 
@@ -83,9 +81,7 @@ def get_dburi(path: str | None) -> str:
     if sqlite_file is not None:
         return _touch_sqlite(sqlite_file)
 
-    db_path = root / _DEFAULT_DB_NAME
-    dburi = _touch_sqlite(db_path)
-    return dburi
+    return _touch_sqlite(root / _DEFAULT_DB_NAME)
 
 
 def sys_micros() -> int:
@@ -123,8 +119,7 @@ def define_ls_table(
     cols = sorted(col_ord, key=col_ord.__getitem__)  # in case we change the system later...
     defs = (f"{_sql.qident(col)} {col_types[col]} NOT NULL" for col in cols)
     pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in chain(column_keys, (time_col,)))})"
-    ddl = f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
-    return ddl
+    return f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
 
 
 def define_ls_infotable(
@@ -136,8 +131,7 @@ def define_ls_infotable(
     # Everything but the final rightmost key which is the unix micros.
     defs = (f"{_sql.qident(col)} {col_types.get(col, 'INTEGER')} NOT NULL" for col in chain(nfks, (LAST_UPD,)))
     pk = f"PRIMARY KEY ({', '.join(_sql.qident(col) for col in nfks)})"
-    ddl = f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
-    return ddl
+    return f"CREATE TABLE IF NOT EXISTS {_sql.qident(table_ref)} ({', '.join((*defs, pk))}) STRICT, WITHOUT ROWID"
 
 
 def mk_fullarrow(ar_tbl: pa.Table, full_cols, col_k, col_v):
@@ -151,3 +145,9 @@ def mk_fullarrow(ar_tbl: pa.Table, full_cols, col_k, col_v):
     cols = [ar_tbl.column(name) if name in names0 else new_cols[name] for name in names]
 
     return pa.Table.from_arrays(cols, names=names)
+
+
+class Rollback(NamedTuple):
+    adjust_columns: Sequence[str]
+    included_keys: dict[str, set[str | None]] | None = None
+    rebuild: bool = False
